@@ -1,9 +1,0 @@
-This is DEV environment
-
-gcloud config set project demo-orchestration
-
-gcloud artifacts repositories create demo-bq-reprocessing --repository-format=docker --location=us-west1 --project=demo-orchestration
-
-gcloud builds submit --tag "us-west1-docker.pkg.dev/demo-orchestration/demo-bq-reprocessing/demo-bq-reprocessing:latest"
-
-gcloud run jobs deploy demo-bq-reprocessing-job --image us-west1-docker.pkg.dev/demo-orchestration/demo-bq-reprocessing/demo-bq-reprocessing:latest --parallelism 2 --cpu 1 --memory 1Gi --task-timeout 10m --region us-west1
