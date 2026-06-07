@@ -1,0 +1,210 @@
+================================================================================
+  GCS → BigQuery Dataflow Streaming Job — Deployment Guide
+  Run each block in order from the dataflow/ directory.
+  Shell: PowerShell (Windows)
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+  VARIABLES  (set once; used in every command below)
+────────────────────────────────────────────────────────────────────────────────
+
+$GCP_PROJECT_ID = "demo-orchestration"   # Dataflow / Composer / GCS
+$BQ_PROJECT_ID  = "demo-datalake-12345"  # BigQuery target project
+$REGION         = "us-west1"
+$REPO           = "demo-pipeline-containers"        # Artifact Registry repo name
+$IMAGE_TAG      = "2.69.0"
+$IMAGE          = "us-west1-docker.pkg.dev/demo-orchestration/$REPO/demo-bq-pipeline:$IMAGE_TAG"
+$compile_bucket = "demo-orchestration_cloudbuild"
+
+$DATAFLOW_BUCKET     = "demo_dataflow_staging"      # dedicated Dataflow temp/staging bucket (demo-orchestration)
+$SUBSCRIPTION        = "projects/demo-ingest/subscriptions/demo-ingest-topic-sub"
+$ORDER_EVENTS_TABLE  = "${BQ_PROJECT_ID}:Demo_Output_GCS.STG_Order_Events"
+# $NOTIFICATION_EVENTS_TABLE = "${BQ_PROJECT_ID}:Demo_Output_GCS.STG_Notification_Events"  # NOTIFICATION_EVENTS: not yet active
+$DLQ_TOPIC           = "projects/demo-ingest/topics/demo_output_gcs_DEADLETTER"
+$JOB_NAME            = "demo-bq-ingestion"
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 1 — Authenticate with GCP
+────────────────────────────────────────────────────────────────────────────────
+
+gcloud auth login
+gcloud config set project $GCP_PROJECT_ID
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 2 — One-time setup  (skip each command if the resource already exists)
+────────────────────────────────────────────────────────────────────────────────
+
+# 2a — Artifact Registry repo
+gcloud artifacts repositories create $REPO `
+  --repository-format=docker `
+  --location=$REGION `
+  --description="Demo pipeline containers"
+
+# 2b — Dedicated Dataflow temp/staging bucket (must live in the same project as
+#       the Dataflow job so the Dataflow service agent can access it)
+gcloud storage buckets create "gs://$DATAFLOW_BUCKET" `
+  --project=$GCP_PROJECT_ID `
+  --location=$REGION `
+  --uniform-bucket-level-access
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 3 — Authenticate Docker with Artifact Registry
+────────────────────────────────────────────────────────────────────────────────
+
+gcloud auth configure-docker "$REGION-docker.pkg.dev"
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 4 — Upload the dataflow/ folder to Cloud Shell
+────────────────────────────────────────────────────────────────────────────────
+
+# In GCP Cloud Shell (console.cloud.google.com → activate Cloud Shell):
+#   1. Click the upload icon (three-dot menu → Upload) and upload the entire
+#      dataflow/ folder, or use the terminal zip+upload approach below.
+#
+# From your local PowerShell — zip and upload via gcloud:
+
+Compress-Archive -Path "." -DestinationPath "$env:TEMP\dataflow.zip" -Force
+gcloud storage cp "$env:TEMP\dataflow.zip" "gs://$compile_bucket/cloudbuild/dataflow.zip"
+
+# Then in Cloud Shell, extract it:
+mkdir -p ~/dataflow && cd ~/dataflow
+
+cd ..
+rm -rf *
+gsutil cp gs://demo-orchestration_cloudbuild/cloudbuild/dataflow.zip .
+unzip -o dataflow.zip
+cd dataflow
+
+rm -rf *
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 5 — Build and push the image via Cloud Build  (no local Docker needed)
+────────────────────────────────────────────────────────────────────────────────
+
+# Run from the dataflow/ directory in Cloud Shell (Linux syntax):
+#
+IMAGE="us-west1-docker.pkg.dev/demo-orchestration/demo-pipeline-containers/demo-bq-pipeline:2.69.0"
+
+gcloud builds submit . \
+  --tag="$IMAGE" \
+  --machine-type=e2-highcpu-8 \
+  --timeout=15m \
+  --project=demo-orchestration
+#
+# Cloud Build sends the local directory to GCP, builds the image, and pushes it
+# to Artifact Registry automatically — no Docker installation required.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 6 — Submit the Dataflow streaming job
+────────────────────────────────────────────────────────────────────────────────
+
+# 1. Set variables
+GCP_PROJECT_ID="demo-orchestration"
+BQ_PROJECT_ID="demo-datalake-12345"
+REGION="us-west1"
+REPO="demo-pipeline-containers"
+IMAGE_TAG="2.69.0"
+IMAGE="us-west1-docker.pkg.dev/${GCP_PROJECT_ID}/${REPO}/demo-bq-pipeline:${IMAGE_TAG}"
+DATAFLOW_BUCKET="demo_dataflow_staging"
+SUBSCRIPTION="projects/demo-ingest/subscriptions/demo-ingest-topic-sub"
+ORDER_EVENTS_TABLE="${BQ_PROJECT_ID}:Demo_Output_GCS.STG_Order_Events"
+DLQ_TOPIC="projects/demo-ingest/topics/demo_output_gcs_DEADLETTER"
+JOB_NAME="demo-bq-ingestion"
+
+# 2. Install Beam
+pip install apache-beam[gcp]==2.69.0
+
+# 3. Submit job  (backslash \ at end of each line, not backtick)
+
+# gcloud storage buckets update gs://$DATAFLOW_BUCKET --soft-delete-duration=0
+
+
+
+cd ..
+rm -rf *
+gsutil cp gs://demo-orchestration_cloudbuild/cloudbuild/dataflow.zip .
+unzip -o dataflow.zip
+cd dataflow
+
+gcloud builds submit . \
+  --tag="$IMAGE" \
+  --machine-type=e2-highcpu-8 \
+  --timeout=15m \
+  --project=demo-orchestration
+
+
+python pipeline.py \
+  --runner=DataflowRunner \
+  --project=$GCP_PROJECT_ID \
+  --region=$REGION \
+  --job_name=$JOB_NAME \
+  --temp_location="gs://$DATAFLOW_BUCKET/dataflow/tmp" \
+  --staging_location="gs://$DATAFLOW_BUCKET/dataflow/staging" \
+  --sdk_container_image=$IMAGE \
+  --sdk_location=container \
+  --subnetwork="regions/us-west1/subnetworks/demo-orchestration-subnet-us-west1" \
+  --no_use_public_ips \
+  --input_subscription=$SUBSCRIPTION \
+  --order_events_table=$ORDER_EVENTS_TABLE \
+  --dlq_topic=$DLQ_TOPIC \
+  --streaming \
+  --enable_streaming_engine \
+  --machine_type=e2-small \
+  --num_workers=1 \
+  --max_num_workers=3 \
+  --disk_size_gb=20
+# --notification_events_table=$NOTIFICATION_EVENTS_TABLE   ← NOTIFICATION_EVENTS: not yet active; add before --dlq_topic when ready
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 7 — Verify the job started
+────────────────────────────────────────────────────────────────────────────────
+
+gcloud dataflow jobs list \
+  --project=demo-orchestration \
+  --region=us-west1 \
+  --filter="name=demo-bq-ingestion AND state=Running" \
+  --format="table(id, name, state)"
+
+
+────────────────────────────────────────────────────────────────────────────────
+  CANCELLING / DRAINING THE JOB  (when you need to redeploy)
+────────────────────────────────────────────────────────────────────────────────
+
+# Get the job ID first
+gcloud dataflow jobs list --region=$REGION --filter="name=$JOB_NAME"
+
+# Drain (finish in-flight work before stopping — preferred for streaming)
+gcloud dataflow jobs drain JOB_ID --region=$REGION
+
+# Cancel immediately (drops in-flight work — use only if drain is too slow)
+gcloud dataflow jobs cancel JOB_ID --region=$REGION
+
+
+────────────────────────────────────────────────────────────────────────────────
+  NOTES
+────────────────────────────────────────────────────────────────────────────────
+
+- Line continuation in PowerShell uses a backtick (`) not a backslash (\).
+  There must be NO space after the backtick or the continuation will break.
+
+- Steps 4–5 use GCP Cloud Build (no local Docker required).  The build runs on
+  Google-managed infrastructure and pushes directly to Artifact Registry.
+  Ensure the Cloud Build service account has Artifact Registry Writer permission
+  (roles/artifactregistry.writer) on the demo-orchestration project.
+
+- --enable_streaming_engine offloads windowing state to Google-managed backend,
+  reducing worker memory. Recommended for all new streaming jobs.
+
+- The Beam SDK version in the base image (Dockerfile FROM line) must match the
+  version pip installs from requirements.txt. If you pin requirements.txt to a
+  specific version, update the FROM tag in the Dockerfile to match.
+
+- For prod, change DATAFLOW_BUCKET to "demo_dataflow_staging_prod" (create it
+  the same way as Step 2b), and update SUBSCRIPTION to the prod Pub/Sub subscription name.
